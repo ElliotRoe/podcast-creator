@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Transcribes all audio files in a specified folder (or Azure container) using the 
-Azure Speech-to-Text batch API.
-
+Transcribes all audio files in a specified folder using OpenAI's Whisper model.
 Saves transcriptions as .txt files and optionally raw JSON responses.
 """
 
@@ -11,12 +9,10 @@ import os
 import sys
 import argparse
 import json
-import time
-import requests
 import logging
-import uuid
-from typing import Dict, Any, List, Optional
+import time
 from pathlib import Path
+from typing import Dict, Any, List, Optional, Union
 from dotenv import load_dotenv
 
 # Set up logging
@@ -24,464 +20,315 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Supported audio extensions
-SUPPORTED_AUDIO_EXTENSIONS = ['.wav', '.mp3', '.ogg', '.flac']
+SUPPORTED_AUDIO_EXTENSIONS = ['.wav', '.mp3', '.ogg', '.flac', '.m4a', '.webm']
 
-def transcribe_container(
-    speech_key: str,
-    service_region: str,
-    container_sas_url: str,
-    locale: str = "en-US",
-    output_folder: str = None,
-    cleanup: bool = False  # Make cleanup optional and disabled by default
+def transcribe_audio_whisper(
+    audio_file_path: str,
+    model_name: str = "small",
+    language: Optional[str] = None,
+    task: str = "transcribe",
+    verbose: bool = False,
+    **kwargs
 ) -> Dict[str, Any]:
     """
-    Transcribes all audio files in an Azure Blob Storage container using the batch API.
+    Transcribes audio using OpenAI's Whisper model locally.
     
     Args:
-        speech_key: Azure Speech Service subscription key.
-        service_region: Azure Speech Service region (e.g., 'eastus').
-        container_sas_url: SAS URL with read access to the container with audio files.
-        locale: Language locale for transcription.
-        output_folder: Local folder to save transcription results.
-        cleanup: Whether to delete the transcription job after processing (default: False).
+        audio_file_path: Path to the audio file.
+        model_name: Whisper model to use (tiny, base, small, medium, large, turbo).
+        language: Language code (optional, will auto-detect if not provided).
+        task: Task to perform (transcribe or translate).
+        verbose: Whether to show verbose output.
         
     Returns:
-        Dictionary mapping filenames to their transcription results.
+        Dictionary containing the transcription result.
     """
-    logger.info(f"Starting batch transcription for container: {container_sas_url}")
-    
-    # 1. Create a batch transcription for the entire container
-    transcription_id = create_container_transcription(
-        speech_key=speech_key,
-        service_region=service_region,
-        container_url=container_sas_url,
-        locale=locale,
-        display_name=f"ContainerTranscription_{uuid.uuid4()}"
-    )
-    
-    if not transcription_id:
-        raise Exception("Failed to create batch transcription for container")
-    
-    logger.info(f"Created batch transcription with ID: {transcription_id}")
-    
-    # 2. Poll until the transcription is complete
-    transcription_result = poll_transcription_status(
-        speech_key=speech_key,
-        service_region=service_region,
-        transcription_id=transcription_id
-    )
-    
-    # 3. Get the transcription files (results)
-    transcription_files = get_transcription_files(
-        speech_key=speech_key,
-        service_region=service_region,
-        transcription_id=transcription_id
-    )
-    
-    # 4. Process and save all results
-    results = {}
-    
-    for file_data in transcription_files:
-        if file_data.get("kind") == "Transcription":
-            # Get the original audio filename
-            audio_filename = file_data.get("name", "unknown.wav")
-            result_url = file_data.get("links", {}).get("contentUrl")
-            
-            if result_url:
-                logger.info(f"Processing result for {audio_filename}")
-                result_response = requests.get(result_url)
-                if result_response.status_code == 200:
-                    result_data = result_response.json()
-                    
-                    # Save results
-                    if output_folder:
-                        base_name = Path(audio_filename).stem
-                        txt_path = os.path.join(output_folder, f"{base_name}.txt")
-                        json_path = os.path.join(output_folder, f"{base_name}.json")
-                        
-                        # Create and save transcript
-                        transcript = create_pretty_transcript(result_data)
-                        save_text_file(transcript, txt_path)
-                        
-                        # Save raw JSON
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(result_data, f, indent=2)
-                    
-                    # Add to results dictionary
-                    results[audio_filename] = result_data
-    
-    # 5. Clean up the transcription only if requested
-    if cleanup:
-        logger.info(f"Cleaning up transcription job {transcription_id}")
-        delete_transcription(
-            speech_key=speech_key,
-            service_region=service_region,
-            transcription_id=transcription_id
-        )
-    else:
-        logger.info(f"Keeping transcription job {transcription_id} for future reference")
-    
-    return results
-
-def create_container_transcription(
-    speech_key: str,
-    service_region: str,
-    container_url: str,
-    locale: str = "en-US",
-    display_name: str = "Container Transcription"
-) -> str:
-    """
-    Creates a batch transcription job for all files in a container.
-    
-    Args:
-        speech_key: Azure Speech Service subscription key.
-        service_region: Azure Speech Service region.
-        container_url: SAS URL with read access to container with audio files.
-        locale: Language locale (e.g., "en-US").
-        display_name: Display name for the transcription.
-        
-    Returns:
-        The transcription ID if successful, otherwise None.
-    """
-    endpoint = f"https://{service_region}.api.cognitive.microsoft.com/speechtotext/v3.2/transcriptions"
-    
-    headers = {
-        "Ocp-Apim-Subscription-Key": speech_key,
-        "Content-Type": "application/json"
-    }
-    
-    body = {
-        "contentContainerUrl": container_url,
-        "locale": locale,
-        "displayName": display_name,
-        "properties": {
-            "wordLevelTimestampsEnabled": True,
-            "diarizationEnabled": True,
-            "punctuationMode": "DictatedAndAutomatic",
-            "profanityFilterMode": "Masked"
-        }
-    }
-    
     try:
-        response = requests.post(endpoint, headers=headers, json=body)
-        
-        if response.status_code == 201 or response.status_code == 200:
-            # Extract the transcription ID from the self link
-            transcription_data = response.json()
-            transcription_self_url = transcription_data.get("self", "")
-            transcription_id = transcription_self_url.split("/")[-1]
-            return transcription_id
-        else:
-            logger.error(f"Failed to create transcription. Status code: {response.status_code}")
-            logger.error(f"Response: {response.text}")
-            return None
+        import whisper
+    except ImportError:
+        logger.error("OpenAI Whisper package not found. Please install with: pip install openai-whisper")
+        sys.exit(1)
     
-    except Exception as e:
-        logger.error(f"Error creating batch transcription: {e}")
-        return None
-
-def poll_transcription_status(
-    speech_key: str,
-    service_region: str,
-    transcription_id: str,
-    polling_interval: int = 5,
-    timeout: int = 1800  # 30 minutes
-) -> Dict[Any, Any]:
-    """
-    Polls the transcription status until it succeeds or fails.
-    
-    Args:
-        speech_key: Azure Speech Service subscription key.
-        service_region: Azure Speech Service region.
-        transcription_id: The ID of the transcription to poll.
-        polling_interval: Time in seconds between polling requests.
-        timeout: Maximum time to wait for completion in seconds.
-        
-    Returns:
-        The final transcription status data.
-        
-    Raises:
-        Exception: If the transcription fails or times out.
-    """
-    endpoint = f"https://{service_region}.api.cognitive.microsoft.com/speechtotext/v3.2/transcriptions/{transcription_id}"
-    
-    headers = {
-        "Ocp-Apim-Subscription-Key": speech_key
-    }
+    if not os.path.exists(audio_file_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
     
     start_time = time.time()
-    completed = False
+    logger.info(f"Loading Whisper model: {model_name}")
     
-    while not completed:
-        # Check if we've exceeded the timeout
-        if time.time() - start_time > timeout:
-            raise Exception(f"Transcription timed out after {timeout} seconds")
+    # Load the model
+    model = whisper.load_model(model_name)
+    
+    logger.info(f"Transcribing: {os.path.basename(audio_file_path)}")
+    
+    # Set up transcription options
+    options = {}
+    if language:
+        options["language"] = language
+    
+    # Perform transcription
+    result = model.transcribe(
+        audio_file_path, 
+        task=task,
+        verbose=verbose,
+        **options
+    )
+    
+    elapsed = time.time() - start_time
+    logger.info(f"Transcription completed in {elapsed:.2f} seconds")
+    
+    return result
+
+def process_directory(
+    input_dir: str,
+    output_dir: str,
+    model_name: str = "small",
+    language: Optional[str] = None,
+    task: str = "transcribe",
+    skip_existing: bool = False,
+    save_json: bool = False,
+    extensions: Optional[List[str]] = None,
+    verbose: bool = False,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Process all audio files in a directory using Whisper.
+    
+    Args:
+        input_dir: Directory containing audio files.
+        output_dir: Directory to save transcriptions.
+        model_name: Whisper model to use.
+        language: Language code (optional).
+        task: Task to perform (transcribe or translate).
+        skip_existing: Skip files that already have transcriptions.
+        save_json: Save raw JSON results.
+        extensions: List of file extensions to process.
+        verbose: Whether to show verbose output.
+        
+    Returns:
+        Dictionary with results and statistics.
+    """
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    
+    # Ensure output directory exists
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Use default extensions if none provided
+    if extensions is None:
+        extensions = SUPPORTED_AUDIO_EXTENSIONS
+    
+    # Find all audio files
+    audio_files = []
+    for ext in extensions:
+        files = list(input_path.glob(f"*{ext}"))
+        files.extend(list(input_path.glob(f"*{ext.upper()}")))
+        audio_files.extend(files)
+    
+    logger.info(f"Found {len(audio_files)} audio files to process")
+    
+    if not audio_files:
+        logger.warning(f"No audio files found with extensions: {extensions}")
+        return {"files": [], "stats": {"processed": 0, "skipped": 0, "failed": 0}}
+    
+    # Process each file
+    results = []
+    stats = {"processed": 0, "skipped": 0, "failed": 0}
+    
+    for i, audio_path in enumerate(sorted(audio_files)):
+        base_name = audio_path.stem
+        txt_path = output_path / f"{base_name}.txt"
+        json_path = output_path / f"{base_name}.json" if save_json else None
+        
+        logger.info(f"[{i+1}/{len(audio_files)}] Processing: {audio_path.name}")
+        
+        # Skip if output exists and flag is set
+        if skip_existing and txt_path.exists():
+            logger.info(f"Skipping {audio_path.name} (output already exists)")
+            stats["skipped"] += 1
+            continue
         
         try:
-            response = requests.get(endpoint, headers=headers)
+            # Transcribe with Whisper
+            result = transcribe_audio_whisper(
+                str(audio_path),
+                model_name=model_name,
+                language=language,
+                task=task,
+                verbose=verbose,
+                **kwargs
+            )
             
-            if response.status_code == 200:
-                transcription_data = response.json()
-                status = transcription_data.get("status", "")
-                
-                logger.info(f"Transcription status: {status}")
-                
-                if status == "Succeeded":
-                    completed = True
-                    return transcription_data
-                elif status == "Failed":
-                    error_message = transcription_data.get("properties", {}).get("error", {}).get("message", "Unknown error")
-                    raise Exception(f"Transcription failed: {error_message}")
-                else:
-                    # Still running, wait and try again
-                    time.sleep(polling_interval)
-            else:
-                logger.error(f"Failed to get transcription status. Code: {response.status_code}, Response: {response.text}")
-                time.sleep(polling_interval)
-        
+            # Save as text file
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(result["text"])
+            
+            logger.info(f"Saved transcript to {txt_path}")
+            
+            # Save raw result as JSON if requested
+            if save_json and json_path:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+                logger.info(f"Saved JSON to {json_path}")
+            
+            # Add to results
+            results.append({
+                "file": str(audio_path),
+                "output": str(txt_path),
+                "success": True
+            })
+            
+            stats["processed"] += 1
+            
         except Exception as e:
-            if "Transcription failed" in str(e):
-                raise
-            logger.error(f"Error checking transcription status: {e}")
-            time.sleep(polling_interval)
+            logger.error(f"Error processing {audio_path.name}: {str(e)}")
+            results.append({
+                "file": str(audio_path),
+                "error": str(e),
+                "success": False
+            })
+            stats["failed"] += 1
+    
+    return {
+        "files": results,
+        "stats": stats
+    }
 
-def get_transcription_files(
-    speech_key: str,
-    service_region: str,
-    transcription_id: str
-) -> List[Dict[Any, Any]]:
+def create_pretty_transcript_from_segments(segments: List[Dict[str, Any]]) -> str:
     """
-    Gets the list of files (results) for a completed transcription.
+    Create a human-readable transcript from Whisper segments.
+    Includes speaker information if available.
     
     Args:
-        speech_key: Azure Speech Service subscription key.
-        service_region: Azure Speech Service region.
-        transcription_id: The ID of the completed transcription.
+        segments: List of segment dictionaries from Whisper.
         
     Returns:
-        List of file data objects.
+        Formatted transcript string.
     """
-    endpoint = f"https://{service_region}.api.cognitive.microsoft.com/speechtotext/v3.2/transcriptions/{transcription_id}/files"
+    lines = []
+    current_speaker = None
     
-    headers = {
-        "Ocp-Apim-Subscription-Key": speech_key
-    }
-    
-    try:
-        response = requests.get(endpoint, headers=headers)
+    for segment in segments:
+        # Check if there's a speaker field (from diarization)
+        speaker = segment.get("speaker", None)
+        text = segment.get("text", "").strip()
         
-        if response.status_code == 200:
-            files_data = response.json()
-            return files_data.get("values", [])
-        else:
-            logger.error(f"Failed to get transcription files. Code: {response.status_code}, Response: {response.text}")
-            return []
+        if not text:
+            continue
             
-    except Exception as e:
-        logger.error(f"Error getting transcription files: {e}")
-        return []
-
-def delete_transcription(
-    speech_key: str,
-    service_region: str,
-    transcription_id: str
-) -> bool:
-    """
-    Deletes a transcription from the service.
-    
-    Args:
-        speech_key: Azure Speech Service subscription key.
-        service_region: Azure Speech Service region.
-        transcription_id: The ID of the transcription to delete.
-        
-    Returns:
-        True if deletion was successful, False otherwise.
-    """
-    endpoint = f"https://{service_region}.api.cognitive.microsoft.com/speechtotext/v3.2/transcriptions/{transcription_id}"
-    
-    headers = {
-        "Ocp-Apim-Subscription-Key": speech_key
-    }
-    
-    try:
-        response = requests.delete(endpoint, headers=headers)
-        
-        if response.status_code == 204 or response.status_code == 200:
-            logger.info(f"Transcription {transcription_id} deleted successfully")
-            return True
-        else:
-            logger.warning(f"Failed to delete transcription. Code: {response.status_code}, Response: {response.text}")
-            return False
+        # Add speaker marker if speaker changes
+        if speaker is not None and speaker != current_speaker:
+            if lines:  # Add blank line for readability
+                lines.append("")
+            lines.append(f"--- Speaker {speaker} ---")
+            current_speaker = speaker
             
-    except Exception as e:
-        logger.warning(f"Error deleting transcription: {e}")
-        return False
-
-def create_pretty_transcript(transcript_data: Dict[Any, Any]) -> str:
-    """Create a simple, human-readable transcript focusing on speakers and their text."""
-    pretty_transcript = []
+        # Add the text
+        lines.append(text)
     
-    # Check if we have recognizedPhrases in the format from the batch API
-    combined_results = transcript_data.get("combinedRecognizedPhrases", [])
-    if combined_results:
-        # Simple approach for batch API results - just use the combined text
-        for result in combined_results:
-            pretty_transcript.append(result.get("display", ""))
-        return "\n\n".join(pretty_transcript)
-    
-    # For results with recognized phrases (more detailed output)
-    recognized_phrases = transcript_data.get("recognizedPhrases", [])
-    if recognized_phrases:
-        current_speaker = None
-        
-        # Sort phrases by offset time if possible
-        if recognized_phrases and "offsetInTicks" in recognized_phrases[0]:
-            recognized_phrases = sorted(recognized_phrases, key=lambda x: int(x.get("offsetInTicks", 0)))
-        
-        for phrase in recognized_phrases:
-            # Get speaker information if available
-            speaker_id = phrase.get("speaker", None)
-            
-            # Get the display text
-            display_text = phrase.get("nBest", [{}])[0].get("display", "").strip()
-            if not display_text:
-                continue
-                
-            # Add speaker information if it changed
-            if speaker_id is not None and speaker_id != current_speaker:
-                if pretty_transcript:  # Add a blank line for readability
-                    pretty_transcript.append("")
-                pretty_transcript.append(f"--- Speaker {speaker_id} ---")
-                current_speaker = speaker_id
-            
-            # Add the text
-            pretty_transcript.append(display_text)
-    
-    # Fallback for simpler formats
-    phrases = transcript_data.get('phrases', [])
-    if phrases:
-        # This is similar to the existing function
-        if phrases and not isinstance(phrases[0].get('offset'), (int, float)):
-            sorted_phrases = phrases 
-        else:
-            sorted_phrases = sorted(phrases, key=lambda x: x.get('offset', 0))
-        
-        current_speaker_label = None
-        for phrase in sorted_phrases:
-            speaker_id = phrase.get('speaker')
-            channel = phrase.get('channel')
-            text = phrase.get('text', '')
-            
-            if speaker_id is not None:
-                speaker_label = f"Speaker {speaker_id}"
-            elif channel is not None:
-                speaker_label = f"Channel {channel}"
-            else:
-                speaker_label = "Speaker"
-
-            if speaker_label != current_speaker_label:
-                if pretty_transcript:
-                    pretty_transcript.append("")
-                pretty_transcript.append(f"--- {speaker_label} ---")
-                current_speaker_label = speaker_label
-                
-            pretty_transcript.append(text.strip())
-    
-    if not pretty_transcript:
-        return "No transcription data found in the expected format."
-        
-    return "\n".join(pretty_transcript)
-
-def save_text_file(text_content: str, output_path: str) -> None:
-    """Saves text content to a file."""
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(text_content)
-        logger.info(f"File saved successfully to: {output_path}")
-    except Exception as e:
-        logger.error(f"Error saving file to {output_path}: {e}")
-        
-# --- Main Execution --- 
+    return "\n".join(lines)
 
 def main():
     # Load environment variables from .env file
     load_dotenv()
-
-    parser = argparse.ArgumentParser(description="Transcribe audio files using Azure Speech-to-Text batch API.")
     
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--input-folder', help='Path to local folder containing audio files (for local processing)')
-    group.add_argument('--container-sas-url', help='SAS URL for Azure Blob Storage container with audio files')
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio files using OpenAI Whisper",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     
-    parser.add_argument('--output-folder', required=True, help='Path to save transcripts and JSON files')
-    parser.add_argument('--speech-key', required=False, help='Azure Speech Service Subscription Key (or set AZURE_SPEECH_KEY env var)')
-    parser.add_argument('--service-region', required=False, default="eastus", help='Azure Speech Service Region (e.g., eastus). Default: eastus')
-    parser.add_argument('--locale', default="en-US", help='Locale for transcription. Default: en-US')
-    parser.add_argument('--save-json', action='store_true', help='Save the raw Azure JSON response alongside the transcript')
-    parser.add_argument('--skip-existing', action='store_true', help='Skip transcription if the output .txt file already exists')
-    parser.add_argument('--cleanup', action='store_true', help='Delete the transcription job after processing (default: False)')
-
+    parser.add_argument(
+        "--input-folder", 
+        required=True,
+        help="Path to folder containing audio files"
+    )
+    
+    parser.add_argument(
+        "--output-folder", 
+        required=True,
+        help="Path to folder for saving transcripts"
+    )
+    
+    parser.add_argument(
+        "--model", 
+        default="small",
+        choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large", "large-v1", "large-v2", "large-v3", "turbo"],
+        help="Whisper model to use"
+    )
+    
+    parser.add_argument(
+        "--language", 
+        default=None,
+        help="Language code (e.g., 'en', 'es', 'fr', etc.). If not provided, will auto-detect"
+    )
+    
+    parser.add_argument(
+        "--task", 
+        default="transcribe",
+        choices=["transcribe", "translate"],
+        help="Whether to transcribe or translate to English"
+    )
+    
+    parser.add_argument(
+        "--save-json", 
+        action="store_true",
+        help="Save raw Whisper JSON output alongside transcript"
+    )
+    
+    parser.add_argument(
+        "--skip-existing", 
+        action="store_true",
+        help="Skip files that already have transcripts"
+    )
+    
+    parser.add_argument(
+        "--file-type", 
+        default="all",
+        choices=["wav", "mp3", "m4a", "all"],
+        help="Audio file type to process"
+    )
+    
+    parser.add_argument(
+        "--verbose", 
+        action="store_true",
+        help="Show verbose output"
+    )
+    
     args = parser.parse_args()
-
-    # Get credentials from args or environment variables
-    speech_key = args.speech_key or os.getenv("AZURE_SPEECH_KEY") or os.getenv("AZURE_AI_KEY")
-    service_region = args.service_region or os.getenv("AZURE_SPEECH_REGION", "eastus")
     
-    if not speech_key:
-        logger.error("Azure Speech Key not found. Provide via --speech-key or set AZURE_SPEECH_KEY/AZURE_AI_KEY env var.")
-        sys.exit(1)
+    # Set up file extensions based on the file-type argument
+    if args.file_type == "all":
+        extensions = SUPPORTED_AUDIO_EXTENSIONS
+    else:
+        extensions = [f".{args.file_type}"]
     
-    logger.info(f"Using Azure Speech service in region: {service_region}")
-
-    # Create output folder
-    output_folder = Path(args.output_folder)
-    try:
-        output_folder.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Output will be saved to: {output_folder}")
-    except OSError as e:
-        logger.error(f"Could not create output folder {output_folder}: {e}")
-        sys.exit(1)
+    # Process the directory
+    start_time = time.time()
+    results = process_directory(
+        input_dir=args.input_folder,
+        output_dir=args.output_folder,
+        model_name=args.model,
+        language=args.language,
+        task=args.task,
+        skip_existing=args.skip_existing,
+        save_json=args.save_json,
+        extensions=extensions,
+        verbose=args.verbose
+    )
     
-    try:
-        # Container-based processing (simpler)
-        if args.container_sas_url:
-            logger.info("Processing all files in container (batch mode)")
-            results = transcribe_container(
-                speech_key=speech_key,
-                service_region=service_region,
-                container_sas_url=args.container_sas_url,
-                locale=args.locale,
-                output_folder=str(output_folder),
-                cleanup=args.cleanup  # Pass the cleanup flag
-            )
-            
-            logger.info(f"Successfully processed {len(results)} files from container")
-            
-        # Local folder processing
-        else:
-            input_folder = Path(args.input_folder)
-            if not input_folder.is_dir():
-                logger.error(f"Input folder not found: {input_folder}")
-                sys.exit(1)
-                
-            logger.warning("Local folder processing requires Azure Storage. Using placeholder implementation.")
-            logger.info(f"To process all files at once (recommended), upload them to an Azure Storage container and use --container-sas-url")
-            
-            # TODO: Implement local folder processing logic using Azure Storage SDK
-            # This would involve:
-            # 1. Creating a container in Azure Storage
-            # 2. Uploading all files to that container
-            # 3. Generating a SAS URL for the container
-            # 4. Calling the transcribe_container function
-            
-            logger.error("Local folder processing is not yet implemented")
-            sys.exit(1)
-            
-    except Exception as e:
-        logger.error(f"Error during transcription: {e}")
-        sys.exit(1)
-        
-    logger.info("Transcription process completed successfully")
-
+    # Print summary
+    stats = results["stats"]
+    total_time = time.time() - start_time
+    
+    logger.info("\n--- Transcription Summary ---")
+    logger.info(f"Successfully transcribed: {stats['processed']}")
+    logger.info(f"Failed:                  {stats['failed']}")
+    logger.info(f"Skipped (already exist): {stats['skipped']}")
+    logger.info(f"Total files:             {stats['processed'] + stats['failed'] + stats['skipped']}")
+    logger.info(f"Total time:              {total_time:.2f} seconds")
+    logger.info("--------------------------")
+    
+    if stats["failed"] > 0:
+        sys.exit(1)  # Exit with error code if any transcriptions failed
+    
 if __name__ == "__main__":
     main() 
